@@ -195,6 +195,18 @@ class Predicting:
         self.roc_dir  = os.path.join(self.save_dir, 'ROC_curves')
         os.makedirs(self.roc_dir, exist_ok=True)
 
+        tuned = self.cfg.get('tuned_thresholds')
+        if tuned:
+            lc = self.dc['label_columns']
+            self.thresholds = np.array([tuned[name] for name in lc])
+            self.log(f'\nPer-class thresholds loaded:')
+            for name, t in zip(lc, self.thresholds):
+                self.log(f'  {name:20s}: {t:.3f}')
+        else:
+            default = self.ec.get('threshold', 0.5)
+            self.thresholds = np.full(len(self.dc['label_columns']), default)
+            self.log(f'\nUsing default threshold: {default}')
+
     # ── INFERENCE ────────────────────────────────────────────
     def _run_inference(self):
         self.model.eval()
@@ -210,29 +222,30 @@ class Predicting:
         return total / max(n, 1), np.concatenate(preds), np.concatenate(tgts)
 
     # ── METRICS ──────────────────────────────────────────────
-    # ── METRICS ──────────────────────────────────────────────
     def _metrics(self, preds, tgts):
-        lc, thr = self.dc['label_columns'], self.ec.get('threshold', 0.5)
+        lc = self.dc['label_columns']
+        thresholds = self.thresholds  # ← per-class thresholds
+        
         m, aurocs, auprcs, per_class = {}, [], [], []
         for i, c in enumerate(lc):
             p, n = tgts[:, i].sum(), len(tgts) - tgts[:, i].sum()
-            row = {'label': c, 'n_pos': int(p), 'n_neg': int(n)}
+            row = {'label': c, 'n_pos': int(p), 'n_neg': int(n),
+                'threshold': float(thresholds[i])}  # ← track which threshold used
             if p > 0 and n > 0:
                 a = roc_auc_score(tgts[:, i], preds[:, i]); aurocs.append(a); m[f'auroc_{c}'] = a; row['auroc'] = a
             if p > 0:
                 a = average_precision_score(tgts[:, i], preds[:, i]); auprcs.append(a); m[f'auprc_{c}'] = a; row['auprc'] = a
-            bi = (preds[:, i] >= thr).astype(int)
+            
+            # Per-class threshold instead of fixed 0.5
+            bi = (preds[:, i] >= thresholds[i]).astype(int)
             row['f1'] = float(f1_score(tgts[:, i], bi, zero_division=0))
             per_class.append(row)
 
-        binary_preds = (preds >= thr).astype(int)
+        binary_preds = (preds >= thresholds).astype(int)  # ← array broadcast
 
-        # Macro
         m['auroc_macro'] = float(np.mean(aurocs)) if aurocs else 0.
         m['auprc_macro'] = float(np.mean(auprcs)) if auprcs else 0.
         m['f1_macro']    = float(f1_score(tgts, binary_preds, average='macro', zero_division=0))
-
-        # Micro
         m['auroc_micro'] = float(roc_auc_score(tgts, preds, average='micro'))
         m['auprc_micro'] = float(average_precision_score(tgts, preds, average='micro'))
         m['f1_micro']    = float(f1_score(tgts, binary_preds, average='micro', zero_division=0))
@@ -252,11 +265,11 @@ class Predicting:
         self.log(f'{"AUPRC":<16} {metrics["auprc_macro"]:>10.4f} {metrics["auprc_micro"]:>10.4f}')
         self.log(f'{"F1":<16} {metrics["f1_macro"]:>10.4f} {metrics["f1_micro"]:>10.4f}')
 
-        self.log(f'\n{"Label":<20} {"AUROC":>8} {"AUPRC":>8} {"F1":>8} {"Pos":>8} {"Neg":>8}')
-        self.log('─' * 60)
+        self.log(f'\n{"Label":<20} {"AUROC":>8} {"AUPRC":>8} {"F1":>8} {"Thresh":>8} {"Pos":>8} {"Neg":>8}')
+        self.log('─' * 70)
         for r in per_class:
             self.log(f'{r["label"]:<20} {r.get("auroc",0):>8.4f} {r.get("auprc",0):>8.4f} '
-                    f'{r["f1"]:>8.4f} {r["n_pos"]:>8} {r["n_neg"]:>8}')
+                    f'{r["f1"]:>8.4f} {r["threshold"]:>8.3f} {r["n_pos"]:>8} {r["n_neg"]:>8}')
 
         # Save results
         results = {'test_loss': loss, **metrics, 'per_class': per_class}

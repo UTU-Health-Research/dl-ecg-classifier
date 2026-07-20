@@ -1,6 +1,6 @@
 import os, time, json, copy, numpy as np, torch, torch.nn as nn
 from torch.utils.data import DataLoader
-from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, roc_curve
+from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, roc_curve, precision_recall_curve
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -99,10 +99,47 @@ class Training:
             with torch.no_grad(): preds.append(torch.sigmoid(logits).cpu().numpy())
             tgts.append(lbl.cpu().numpy())
         return total / max(n, 1), np.concatenate(preds), np.concatenate(tgts)
+    
+    # ── THRESHOLD TUNING ─────────────────────────────────────
+    def _find_best_thresholds(self, loader):
+        """Find per-class optimal thresholds on validation set."""
+        self.model.eval()
+        _, preds, tgts = self._run_epoch(loader, False)
+        
+        lc = self.dc['label_columns']
+        best_thresholds = np.full(len(lc), 0.5)  # default fallback
+        
+        self.log('\n── Per-Class Threshold Tuning (on validation set) ──')
+        for i, name in enumerate(lc):
+            pos = tgts[:, i].sum()
+            if pos == 0:
+                continue
+            
+            precision, recall, thresholds = precision_recall_curve(
+                tgts[:, i], preds[:, i]
+            )
+            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+            best_idx = np.argmax(f1)
+            best_thresholds[i] = thresholds[best_idx]
+            self.log(f'  {name:20s}: threshold={thresholds[best_idx]:.3f}  F1={f1[best_idx]:.4f}')
+        
+        # Save thresholds to file
+        thr_dict = {name: float(best_thresholds[i]) for i, name in enumerate(lc)}
+        with open(os.path.join(self.save_dir, 'best_thresholds.json'), 'w') as f:
+            json.dump(thr_dict, f, indent=2)
+        
+        self.log(f'  Saved to best_thresholds.json')
+        return best_thresholds
 
     # ── METRICS ──────────────────────────────────────────────
-    def _metrics(self, preds, tgts):
-        lc, thr = self.dc['label_columns'], self.ec.get('threshold', 0.5)
+    def _metrics(self, preds, tgts, thresholds=None):
+        lc = self.dc['label_columns']
+        
+        # Use per-class thresholds if provided, else single default
+        if thresholds is None:
+            thr = self.ec.get('threshold', 0.5)
+            thresholds = np.full(len(lc), thr)
+        
         m, aurocs, auprcs = {}, [], []
         for i, c in enumerate(lc):
             p, n = tgts[:, i].sum(), len(tgts) - tgts[:, i].sum()
@@ -112,7 +149,10 @@ class Training:
                 a = average_precision_score(tgts[:, i], preds[:, i]); auprcs.append(a); m[f'auprc_{c}'] = a
         m['auroc_macro'] = float(np.mean(aurocs)) if aurocs else 0.
         m['auprc_macro'] = float(np.mean(auprcs)) if auprcs else 0.
-        m['f1_macro'] = float(f1_score(tgts, (preds >= thr).astype(int), average='macro', zero_division=0))
+        
+        # Per-class thresholds applied here
+        pred_binary = (preds >= thresholds).astype(int)
+        m['f1_macro'] = float(f1_score(tgts, pred_binary, average='macro', zero_division=0))
         return m
 
     # ── TRAIN LOOP ───────────────────────────────────────────
@@ -157,6 +197,8 @@ class Training:
 
         self.log(f'\n{"═"*74}\nDONE — Best ep {self.best_epoch} (AUROC {self.best_metric:.4f})\n{"═"*74}')
         if self.best_state: self.model.load_state_dict(self.best_state)
+        self.best_thresholds = self._find_best_thresholds(self.val_loader)
+        self.log(f'\nThresholds ready. Use self.best_thresholds for test evaluation.')
         self._roc_curves(self.val_loader, 'val')
         self._save_history(hist)
         self.train_ds.close(); self.val_ds.close()

@@ -10,6 +10,7 @@ import os, sys, torch, random, logging, argparse
 import numpy as np
 from ruamel.yaml import YAML
 from src.modeling.predict_utils import Predicting
+import json
 
 
 def main(config_path, checkpoint_override=None):
@@ -28,6 +29,15 @@ def main(config_path, checkpoint_override=None):
 
     if not os.path.isfile(cfg['checkpoint_path']):
         raise FileNotFoundError(f'Checkpoint not found: {cfg["checkpoint_path"]}')
+    
+    thr_path = os.path.join('experiments', cfg['experiment']['name'], 'best_thresholds.json')
+    if os.path.isfile(thr_path):
+        with open(thr_path) as f:
+            cfg['tuned_thresholds'] = json.load(f)
+        print(f'Loaded per-class thresholds from {thr_path}')
+    else:
+        cfg['tuned_thresholds'] = None
+        print(f'No thresholds file found, using default 0.5')
 
     # Logging
     save_dir = os.path.join(os.getcwd(), 'experiments', cfg['experiment']['name'])

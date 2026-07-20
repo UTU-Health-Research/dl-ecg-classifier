@@ -30,7 +30,7 @@ METADATA_CSV    = os.path.join(DATA_DIR, 'metadata.csv')
 MEDIANS_JSON    = os.path.join(SPLITS_DIR, 'vitals_medians.json')
 
 CONFIG_DIR      = os.path.join(os.getcwd(), 'configs')
-EXPERIMENT_NAME = 'experiment_003'
+EXPERIMENT_NAME = 'experiment_004'
 
 
 # ══════════════════════════════════════════════════════════════

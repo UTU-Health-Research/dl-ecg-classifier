@@ -1,201 +1,224 @@
-import os, re, sys
+"""
+Generates a single experiment configuration YAML that serves as
+the source of truth for training, evaluation, and inference.
+
+Reads metadata.csv and vitals_medians.json to auto-populate
+label columns, vitals stats, and data dimensions.
+
+Input
+    data/preprocessed_uppsala_data/metadata.csv
+    data/preprocessed_uppsala_data/splits/vitals_medians.json
+
+Output
+    configs/experiment_001.yaml
+"""
+
+import os, json, sys
+import pandas as pd
 from ruamel.yaml import YAML
-from itertools import combinations
+from datetime import datetime
 
-def save_yaml(yaml_str, yaml_path, split):
-    ''' Save the given string as a yaml file in the given location
-    '''
-    
-    # Make the yaml directory
-    if not os.path.isdir(yaml_path):
-        os.mkdir(yaml_path)
-    
-    # Write the yaml file
-    with open(os.path.join(yaml_path, split), 'w') as yaml_file:
-        yaml = YAML()
-        code = yaml.load(yaml_str)
-        yaml.dump(code, yaml_file)
-    
-        
-def write_yaml(csvs, split, yaml_dict, phase):
-    ''' Make a yaml file for prediction. The base of it is presented above
 
-    :csvs [list]: for training, there can be two csv in a list of csvs, 
-                  where the first corresponds to a training csv and the second to a validation csv
-                  for testing, there needs to be only one csv file listed
-    '''
-    yaml_str = ''
+# ══════════════════════════════════════════════════════════════
+#  PATHS  (edit these if your layout differs)
+# ══════════════════════════════════════════════════════════════
 
-    if phase == 'train':
-        yaml_str = f"train_file: {csvs[0]}\nval_file: {csvs[1]}\n"
-        yaml_path = train_yaml_save_path
-    
-    elif phase == 'test':
-        # The name of the model (the same as the name of the yaml file the model has been trained)
-        model_name = split.split('.')[0] + '.pth'
-        yaml_str = f"test_file: {csvs[0]}\nmodel: {model_name}\n"
-        yaml_path = test_yaml_save_path
+DATA_DIR        = os.path.join(os.getcwd(), 'data', 'preprocessed_uppsala_data')
+SPLITS_DIR      = os.path.join(DATA_DIR, 'split_csvs')
+METADATA_CSV    = os.path.join(DATA_DIR, 'metadata.csv')
+MEDIANS_JSON    = os.path.join(SPLITS_DIR, 'vitals_medians.json')
 
-    if yaml_str == '':
-        raise Exception('No string to write to a YAML file.')
+CONFIG_DIR      = os.path.join(os.getcwd(), 'configs')
+EXPERIMENT_NAME = 'experiment_001'
 
-    for key, value in yaml_dict.items():
-        if isinstance(value, float):
-            yaml_str += f"{key}: {value:f}\n"
-        else:
-            yaml_str += f"{key}: {value}\n"
 
-    save_yaml(yaml_str, yaml_path, split)
+# ══════════════════════════════════════════════════════════════
+#  AUTO-DISCOVER FROM DATA
+# ══════════════════════════════════════════════════════════════
+
+def discover_from_data():
+    """Read metadata + medians to extract labels, vitals info, etc."""
+
+    info = {}
+
+    # ── Label columns ────────────────────────────────────────
+    print(f'Reading {METADATA_CSV} ...')
+    df = pd.read_csv(METADATA_CSV, nrows=5)          # only need columns
+    label_cols = sorted(c for c in df.columns if c.startswith('label_'))
+    info['label_cols']  = label_cols
+    info['num_classes'] = len(label_cols)
+    print(f'  Found {len(label_cols)} label columns')
+
+    # ── Split file sizes ─────────────────────────────────────
+    for split in ['train', 'val', 'test']:
+        path = os.path.join(SPLITS_DIR, f'{split}.csv')
+        if os.path.exists(path):
+            n = sum(1 for _ in open(path)) - 1       # minus header
+            info[f'{split}_segments'] = n
+            print(f'  {split}.csv : {n:,} segments')
+
+    # ── Vitals medians ───────────────────────────────────────
+    if os.path.exists(MEDIANS_JSON):
+        with open(MEDIANS_JSON) as f:
+            info['vitals_medians'] = json.load(f)
+        print(f'  Vitals medians loaded from {MEDIANS_JSON}')
+    else:
+        print(f'  ⚠ {MEDIANS_JSON} not found — vitals_medians will be empty')
+        info['vitals_medians'] = {}
+
+    return info
+
+
+# ══════════════════════════════════════════════════════════════
+#  BUILD CONFIG DICT
+# ══════════════════════════════════════════════════════════════
+
+def build_config(info):
+    """Construct the full experiment config as an ordered dict."""
+
+    config = {}
+
+    # ── Experiment metadata ──────────────────────────────────
+    config['experiment'] = {
+        'name':        EXPERIMENT_NAME,
+        'description': 'Multi-label ECG classification with vitals fusion',
+        'created':     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'seed':        42,
+    }
+
+    # ── Data ─────────────────────────────────────────────────
+    config['data'] = {
+        'data_dir':     os.path.relpath(DATA_DIR, os.getcwd()),
+        'splits_dir':   os.path.relpath(SPLITS_DIR, os.getcwd()),
+        'train_csv':    'train.csv',
+        'val_csv':      'val.csv',
+        'test_csv':     'test.csv',
+
+        # Signal properties
+        'fs':               250,
+        'segment_samples':  2500,
+        'num_leads':        11,
+        'lead_order':       ['I', 'II', 'III', 'aVR', 'aVL', 'aVF',
+                             'V1', 'V2', 'V3', 'V4', 'V5'],
+
+        # Labels
+        'label_columns':    info['label_cols'],
+        'num_classes':      info['num_classes'],
+    }
+
+    # ── Vitals ───────────────────────────────────────────────
+    config['vitals'] = {
+        'columns':       ['Vital_Resp_First', 'Vital_HR_First', 'Vital_Temp_First'],
+        'dim':           3,
+        'impute_method': 'median',
+        'medians':       info['vitals_medians'],
+    }
+
+    # ── Model ────────────────────────────────────────────────
+    config['model'] = {
+        'architecture':     'MobileNetV2_1D_Vitals',
+        'input_channels':   11,
+        'num_classes':      info['num_classes'],
+        'alpha':            1.0,
+        'stride_size':      [2, 2, 2, 2, 2],
+        'kernel_size':      9,
+        'dropout_rate':     0.3,
+        'vitals_dim':       3,
+        'vitals_hidden_dim': 16,
+    }
+
+    # ── Training ─────────────────────────────────────────────
+    config['training'] = {
+        'batch_size':     64,
+        'num_workers':    4,
+        'epochs':         30,
+        'lr':             0.001,
+        'weight_decay':   0.00001,
+
+        # Scheduler
+        'scheduler':      'cosine',
+        'warmup_epochs':  3,
+        'min_lr':         0.000001,
+
+        # Loss
+        'loss':           'BCEWithLogitsLoss',
+        'class_weights':  'auto',           # set to list of 19 floats or null
+
+        # Early stopping
+        'early_stopping': True,
+        'patience':       7,
+        'monitor':        'val_auroc_macro',
+        'monitor_mode':   'max',
+
+        # Checkpointing
+        'save_dir':       'checkpoints',
+        'save_best_only': True,
+    }
+
+    # ── Evaluation ───────────────────────────────────────────
+    config['evaluation'] = {
+        'threshold':  0.5,
+        'metrics':    ['auroc_macro', 'auroc_per_class',
+                       'auprc_macro', 'auprc_per_class',
+                       'f1_macro', 'f1_per_class'],
+    }
+
+    # ── Device ───────────────────────────────────────────────
+    config['device'] = {
+        'gpu_count':  1,
+        'fp16':       False,
+    }
+
+    return config
+
+
+# ══════════════════════════════════════════════════════════════
+#  SAVE
+# ══════════════════════════════════════════════════════════════
+
+def save_config(config, config_path):
+    """Write config dict to a YAML file."""
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+    yaml = YAML()
+    yaml.default_flow_style = False
+    yaml.width = 120
+    yaml.indent(mapping=2, sequence=4, offset=2)
+
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f)
+
+    print(f'\n  ✓ Config saved to {config_path}')
+
+
+# ══════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════
+
+def main():
+    print('=' * 60)
+    print('CREATE EXPERIMENT CONFIG')
+    print('=' * 60)
+
+    # Auto-discover from data artifacts
+    info = discover_from_data()
+
+    # Build config
+    config = build_config(info)
+
+    # Save
+    config_path = os.path.join(CONFIG_DIR, f'{EXPERIMENT_NAME}.yaml')
+    save_config(config, config_path)
+
+    # Print what was generated
+    print(f'\n{"─" * 60}')
+    print('Config contents:')
+    print(f'{"─" * 60}')
+
+    yaml = YAML()
+    yaml.default_flow_style = False
+    yaml.dump(config, sys.stdout)
 
 
 if __name__ == '__main__':
-
-    # ------------------------------------------- # 
-    # --- Parameters to create the yaml files --- #
-    # ------------------------------------------- #
-
-    # Create yamls using stratified (kfold or shufflesplit) data or database-wise (dbwise) splitted?
-    stratified = True 
-
-    # NOTE: Change only the last folder name from the paths below.
-    #       The modeling part is using the paths as they are ('/data/split_csvs/' and 'configs/<training/predicting>')
-
-    # From where to load the csv files of original data split
-    csv_path = os.path.join(os.getcwd(), 'data', 'split_csvs', 'stratified_smoke')
-
-    # Find data from the given csv path
-    # Dbwise: Add the names of the CSV files
-    data = sorted([file for file in os.listdir(csv_path) if not file.startswith('.') and file.endswith('.csv')]) \
-        if stratified else ['PTB_PTBXL.csv', 'SPH.csv', 'G12EC.csv', 'ChapmanShaoxing_Ningbo.csv', 'CPSC_CPSC-Extra.csv']
-    
-    data_dirs = sorted([d for d in os.listdir(csv_path) if os.path.isdir(os.path.join(csv_path, d))])
-
-    # --------------------------------------- #
-
-    # Where to save the training yaml files
-    train_yaml_save_path = os.path.join(os.getcwd(), 'configs', 'training', 'train_yamls_smoke')
-
-    # Where to save the testing yaml files
-    test_yaml_save_path = os.path.join(os.getcwd(), 'configs', 'predicting', 'test_yamls_smoke')
-
-    # How to name the yaml files 
-    name = 'split'
-
-    # ------------------------------------- #
-    # --- Parameters for the yaml files --- #
-    # ------------------------------------- #
-
-    # Don't change the keys! Train/val/test csv files as well as the model file 
-    # (for testing) are automatically set in the yaml files
-
-    train_dict = {
-        
-        # Directory where the csv file for data split are in 'data/split_cvs/'
-        # (the same value as already set in `csv_path`, however, only the basename)
-        'csv_path': os.path.basename(csv_path),
-
-        # Training parameters
-        'batch_size': 10,
-        'num_workers': 0,
-        'epochs': 1,
-        'lr': 0.003,
-        'weight_decay': 0.00001,
-
-        # Device configurations
-        'device_count': 1,
-
-        # Decision threshold for predictions
-        'threshold': 0.5,
-
-        # For ECGs
-        'bandwidth': ''
-    }
-
-    test_dict = {
-        
-        # Directory where the csv file for data split are in 'data/split_cvs/'
-        # (the same value as already set in `csv_path`, however, only the basename)
-        'csv_path': os.path.basename(csv_path),
-
-        # Device configurations
-        'device_count': 1,
-
-        # Decision threshold for predictions
-        'threshold': 0.5,
-
-        # For ECGs
-        'bandwidth': ''
-    }
-
-    # --------------------------------------- #
-    # --------------------------------------- #
-
-    # Names for the yaml files
-    split_names = [] 
-
-    # Train/val/test splitted csv files as a list of lists
-    train_val_test = []
-
-    # Setup either stratified yamls or dbwise yamls
-    if stratified:
-
-        # First, divide train, validation and test splits into own lists
-        train_files = [file for file in data if 'train' in file]
-        val_files = [file for file in data if 'val' in file]
-        test_files = [file for file in data if 'test' in file]
-
-        for i, pair in enumerate(list(zip(train_files, val_files))):
-
-            # Training and validation files separately
-            train_tmp, val_tmp = pair[0], pair[1]
-            
-            # Get the split number of the training file, used to name the corresponding yaml file
-            split_num = re.search('_((\w*)_\d)', pair[0])
-            split_names.append(str(split_num.group(1) + '.yaml'))
-            
-            train_split_num = split_num.group(2)
-            for test_tmp in test_files:
-                # Get the split number of the testing file
-                test_split_num = re.search('_(\w*)', test_tmp).group(1)
-                
-                # If same split number in training, validation and prediction, combine
-                if train_split_num == test_split_num:
-                    train_val_test.append([train_tmp, val_tmp, test_tmp])
-
-    else:
-
-        # Find all combinations of the spesified data (= csv files of the databases)
-        # One is left for testing so taking combinations in size of len(<all csv files>) -1
-        for i, train_val_set in enumerate(combinations(data, len(data)-1)):
-            test_tmp = next(file for file in data if not file in train_val_set)
-
-            # And one is left for validation set so len(combinations took within first loop) -1
-            for j, train_tmp in enumerate(combinations(train_val_set, len(train_val_set)-1)):
-                val_tmp = next(file for file in data if not file in train_tmp and file != test_tmp)
-
-                # Convert a list of csv file names into a single name for a csv file
-                # e.g. from ['G12EC.csv', 'PTB_PTBXL.csv', 'SPH.csv'] to G12EC_PTB_PTBXL_SPH.csv
-                train_tmp = [db.split('.')[0] for db in train_tmp]
-                train_tmp = '_'.join(sorted(train_tmp, key=str.lower)) + '.csv'
-                
-                train_val_test.append([train_tmp, val_tmp, test_tmp])
-                split_names.append(name + '_' + str(i+1) + '_' + str(j+1) + '.yaml')
-
-    print('Total of {} training, validation and testing sets'.format(len(train_val_test)))
-    print('First two training, validation and testing pairs')
-    print(*train_val_test[:2], sep='\n') 
-    print()
-
-    for pair, split in list(zip(train_val_test, split_names)):
-        train_tmp, val_tmp, test_tmp = pair[0], pair[1], pair[2]
-
-        print('Training, validation and testing sets are'.format())
-        print(train_tmp, '\t', val_tmp, '\t', test_tmp)
-        print('Yaml file will be named as', split)
-        print()
-
-        # Training yaml file
-        write_yaml([train_tmp, val_tmp], split, train_dict, phase='train')
-        
-        # Testing yaml file
-        write_yaml([test_tmp], split, test_dict, phase='test')
+    main()

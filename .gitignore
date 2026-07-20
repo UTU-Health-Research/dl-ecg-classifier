@@ -6,20 +6,9 @@ __pycache__/
 
 # Ignore everything in the data directory except smoke data and related csv files
 data/*
-!data/*.csv
-!data/smoke_data/
-!data/split_csvs/stratified_smoke/test_split_1.csv
-!data/split_csvs/stratified_smoke/train_split_1_1.csv
-!data/split_csvs/stratified_smoke/train_split_1_2.csv
-!data/split_csvs/stratified_smoke/train_split_1_3.csv
-!data/split_csvs/stratified_smoke/train_split_1_4.csv
-!data/split_csvs/stratified_smoke/val_split_1_1.csv 
-!data/split_csvs/stratified_smoke/val_split_1_2.csv 
-!data/split_csvs/stratified_smoke/val_split_1_3.csv 
-!data/split_csvs/stratified_smoke/val_split_1_4.csv 
 
 # We also need the weights file for PhysioNet 2021 metric
-!data/physionet2021_weights.csv
+
 
 # Ignore the tar.gz files if loaded in the notebooks directory
 notebooks/*.tar.gz
@@ -27,17 +16,7 @@ notebooks/*.csv
 
 # Ignore all other configuration yaml files except spesific ones for smoke testing
 configs/*
-!configs/predicting/predict_smoke.yaml
-!configs/predicting/predict_stratified_smoke/split_1_1.yaml
-!configs/predicting/predict_stratified_smoke/split_1_2.yaml
-!configs/predicting/predict_stratified_smoke/split_1_3.yaml
-!configs/predicting/predict_stratified_smoke/split_1_4.yaml
-
-!configs/training/train_smoke.yaml
-!configs/training/train_stratified_smoke/split_1_1.yaml
-!configs/training/train_stratified_smoke/split_1_2.yaml
-!configs/training/train_stratified_smoke/split_1_3.yaml
-!configs/training/train_stratified_smoke/split_1_4.yaml
+!configs/experiment_001.yaml
 
 # Ignore the experiments directory
 experiments/*

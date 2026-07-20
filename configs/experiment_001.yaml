@@ -1,0 +1,102 @@
+experiment:
+  name: experiment_001
+  description: Multi-label ECG classification with vitals fusion
+  created: '2026-07-17 15:45:51'
+  seed: 42
+data:
+  data_dir: data\preprocessed_uppsala_data
+  splits_dir: data\preprocessed_uppsala_data\split_csvs
+  train_csv: train.csv
+  val_csv: val.csv
+  test_csv: test.csv
+  fs: 250
+  segment_samples: 2500
+  num_leads: 11
+  lead_order:
+    - I
+    - II
+    - III
+    - aVR
+    - aVL
+    - aVF
+    - V1
+    - V2
+    - V3
+    - V4
+    - V5
+  label_columns:
+    - label_E87
+    - label_I20
+    - label_I21
+    - label_I25
+    - label_I44
+    - label_I47
+    - label_I48
+    - label_I49
+    - label_I50
+    - label_J15
+    - label_J18
+    - label_J44
+    - label_J45
+    - label_J96
+    - label_R00
+    - label_R06
+    - label_R50
+    - label_R55
+    - label_U07
+  num_classes: 19
+vitals:
+  columns:
+    - Vital_Resp_First
+    - Vital_HR_First
+    - Vital_Temp_First
+  dim: 3
+  impute_method: median
+  medians:
+    Vital_Resp_First: 20.0
+    Vital_HR_First: 89.0
+    Vital_Temp_First: 36.8
+model:
+  architecture: MobileNetV2_1D_Vitals
+  input_channels: 11
+  num_classes: 19
+  alpha: 1.0
+  stride_size:
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+  kernel_size: 9
+  dropout_rate: 0.3
+  vitals_dim: 3
+  vitals_hidden_dim: 16
+training:
+  batch_size: 64
+  num_workers: 4
+  epochs: 30
+  lr: 0.001
+  weight_decay: 1e-05
+  scheduler: cosine
+  warmup_epochs: 3
+  min_lr: 1e-06
+  loss: BCEWithLogitsLoss
+  class_weights:
+  early_stopping: true
+  patience: 7
+  monitor: val_auroc_macro
+  monitor_mode: max
+  save_dir: checkpoints
+  save_best_only: true
+evaluation:
+  threshold: 0.5
+  metrics:
+    - auroc_macro
+    - auroc_per_class
+    - auprc_macro
+    - auprc_per_class
+    - f1_macro
+    - f1_per_class
+device:
+  gpu_count: 1
+  fp16: false

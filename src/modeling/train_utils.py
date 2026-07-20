@@ -1,289 +1,201 @@
-import os, sys
-import time
-import torch
-import pandas as pd
-import numpy as np
-from torch import nn
-from torch import optim
+import os, time, json, copy, numpy as np, torch, torch.nn as nn
 from torch.utils.data import DataLoader
-from .models.seresnet18 import resnet18
-from ..dataloader.dataset import ECGDataset, get_transforms
-from .metrics import cal_multilabel_metrics, roc_curves
-import pickle
+from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, roc_curve
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from src.dataloader.ecg_dataset import ECGVitalsDataset
+from src.modeling.models.mobilenetv2_vitals_11lead import MobileNetV2_1D_Vitals
 
-class Training(object):
-    def __init__(self, args):
-        self.args = args
-  
+def _worker_init(worker_id):
+    np.random.seed(np.random.get_state()[1][0] + worker_id)
+
+class Training:
+    def __init__(self, config):
+        self.cfg = config
+        self.dc, self.vc, self.mc, self.tc, self.ec = (
+            config['data'], config['vitals'], config['model'], config['training'], config['evaluation'])
+        self.logger = config.get('logger')
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def log(self, msg):
+        print(msg)
+        if self.logger: self.logger.info(msg)
+
+    # ── SETUP ────────────────────────────────────────────────
     def setup(self):
-        '''Initializing the device conditions, datasets, dataloaders, 
-        model, loss, criterion and optimizer
-        '''
-        
-        # Consider the GPU or CPU condition
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-            self.device_count = self.args.device_count
-            self.args.logger.info('using {} gpu(s)'.format(self.device_count))
-            assert self.args.batch_size % self.device_count == 0, "batch size should be divided by device count"
-        else:
-            self.device = torch.device("cpu")
-            self.device_count = 1
-            self.args.logger.info('using {} cpu'.format(self.device_count))
+        self.log(f'Device: {self.device}')
+        ds_kw = dict(data_dir=self.dc['data_dir'], label_columns=self.dc['label_columns'],
+                     vitals_columns=self.vc['columns'], vitals_medians=self.vc['medians'])
+        self.train_ds = ECGVitalsDataset(os.path.join(self.dc['splits_dir'], self.dc['train_csv']), **ds_kw)
+        self.val_ds   = ECGVitalsDataset(os.path.join(self.dc['splits_dir'], self.dc['val_csv']),   **ds_kw)
+        self.log(f'Train: {len(self.train_ds):,}  Val: {len(self.val_ds):,} segments')
 
-        # Load the datasets       
-        training_set = ECGDataset(self.args.train_path, get_transforms('train'))
-        channels = training_set.channels
-        self.train_dl = DataLoader(training_set,
-                                   batch_size=self.args.batch_size,
-                                   shuffle=True,
-                                   num_workers=self.args.num_workers,
-                                   pin_memory=(True if self.device == 'cuda' else False),
-                                   drop_last=False)
+        nw, bs = self.tc['num_workers'], self.tc['batch_size']
+        ldr_kw = dict(batch_size=bs, num_workers=nw, pin_memory=True,
+                      persistent_workers=nw > 0, worker_init_fn=_worker_init)
+        self.train_loader = DataLoader(self.train_ds, shuffle=True,  drop_last=True,  **ldr_kw)
+        self.val_loader   = DataLoader(self.val_ds,   shuffle=False, drop_last=False, **ldr_kw)
 
-        if self.args.val_path is not None:
-            validation_set = ECGDataset(self.args.val_path, get_transforms('val'))
-            self.validation_files = validation_set.data
-            self.val_dl = DataLoader(validation_set,
-                                    batch_size=1,
-                                    shuffle=False,
-                                    num_workers=self.args.num_workers,
-                                    pin_memory=(True if self.device == 'cuda' else False),
-                                    drop_last=True)
+        mc = self.mc
+        self.model = MobileNetV2_1D_Vitals(
+            input_channels=mc['input_channels'], alpha=mc['alpha'], num_classes=mc['num_classes'],
+            vitals_dim=mc['vitals_dim'], vitals_hidden_dim=mc['vitals_hidden_dim'],
+            stride_size=list(mc['stride_size']), kernel_size=mc['kernel_size'], dropout_rate=mc['dropout_rate'])
 
-
-        self.model = resnet18(in_channel=channels, 
-                              out_channel=len(self.args.labels))
-
-        # Load model if necessary
-        if hasattr(self.args, 'load_model_path'):
-            self.model.load_state_dict(torch.load(self.args.load_model_path))
-            self.args.logger.info('Loaded the model from: {}'.format(self.args.load_model_path))
-        else:
-            self.args.logger.info('Training a new model from the beginning.')
-        
-        # If more than 1 CUDA device used, use data parallelism
-        if self.device_count > 1:
-            self.model = torch.nn.DataParallel(self.model) 
-        
-        # Optimizer
-        self.optimizer = optim.Adam(self.model.parameters(), 
-                                    lr=self.args.lr,
-                                    weight_decay=self.args.weight_decay)
-        
-        self.criterion = nn.BCEWithLogitsLoss()
-        self.sigmoid = nn.Sigmoid()
-        self.sigmoid.to(self.device)
+        if self.cfg.get('device', {}).get('gpu_count', 1) > 1 and torch.cuda.device_count() > 1:
+            self.model = nn.DataParallel(self.model)
         self.model.to(self.device)
-        
+        self.log(f'Params: {sum(p.numel() for p in self.model.parameters()):,}')
+
+        pw = self._pos_weight()
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.tc['lr'], weight_decay=self.tc['weight_decay'])
+        self.scheduler = self._build_scheduler()
+
+        self.best_metric, self.best_epoch, self.patience_ctr, self.best_state = -np.inf, 0, 0, None
+        self.save_dir = os.path.join(os.getcwd(), 'experiments', self.cfg['experiment']['name'])
+        self.roc_dir  = os.path.join(self.save_dir, 'ROC_curves')
+        os.makedirs(self.roc_dir, exist_ok=True)
+
+        from ruamel.yaml import YAML as Y
+        y = Y()
+        with open(os.path.join(self.save_dir, 'config.yaml'), 'w') as f:
+            y.dump({k: v for k, v in self.cfg.items() if k != 'logger'}, f)
+
+    def _pos_weight(self):
+        cw = self.tc.get('class_weights')
+        if cw == 'auto':
+            pos = self.train_ds.labels.sum(0).clip(min=1)
+            w = (len(self.train_ds.labels) - pos) / pos
+            return torch.tensor(w, dtype=torch.float32).to(self.device)
+        if isinstance(cw, list):
+            return torch.tensor(cw, dtype=torch.float32).to(self.device)
+        return None
+
+    def _build_scheduler(self):
+        s, ep, wu, mlr = self.tc.get('scheduler','cosine'), self.tc['epochs'], self.tc.get('warmup_epochs',0), self.tc.get('min_lr',1e-6)
+        if s == 'cosine':  return torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, max(ep-wu,1), eta_min=mlr)
+        if s == 'step':    return torch.optim.lr_scheduler.StepLR(self.optimizer, self.tc.get('step_size',10), self.tc.get('gamma',0.1))
+        if s == 'plateau': return torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='max', patience=5, factor=0.5, min_lr=mlr)
+        return None
+
+    # ── EPOCH ────────────────────────────────────────────────
+    def _run_epoch(self, loader, train=True):
+        self.model.train() if train else self.model.eval()
+        total, n, preds, tgts = 0., 0, [], []
+        for ecg, vit, lbl in tqdm(loader, desc='Train' if train else '  Val', leave=False):
+            ecg, vit, lbl = ecg.to(self.device), vit.to(self.device), lbl.to(self.device)
+            if train: self.optimizer.zero_grad()
+            with torch.set_grad_enabled(train):
+                logits = self.model(ecg, vit)
+                loss = self.criterion(logits, lbl)
+            if train:
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+            total += loss.item(); n += 1
+            with torch.no_grad(): preds.append(torch.sigmoid(logits).cpu().numpy())
+            tgts.append(lbl.cpu().numpy())
+        return total / max(n, 1), np.concatenate(preds), np.concatenate(tgts)
+
+    # ── METRICS ──────────────────────────────────────────────
+    def _metrics(self, preds, tgts):
+        lc, thr = self.dc['label_columns'], self.ec.get('threshold', 0.5)
+        m, aurocs, auprcs = {}, [], []
+        for i, c in enumerate(lc):
+            p, n = tgts[:, i].sum(), len(tgts) - tgts[:, i].sum()
+            if p > 0 and n > 0:
+                a = roc_auc_score(tgts[:, i], preds[:, i]); aurocs.append(a); m[f'auroc_{c}'] = a
+            if p > 0:
+                a = average_precision_score(tgts[:, i], preds[:, i]); auprcs.append(a); m[f'auprc_{c}'] = a
+        m['auroc_macro'] = float(np.mean(aurocs)) if aurocs else 0.
+        m['auprc_macro'] = float(np.mean(auprcs)) if auprcs else 0.
+        m['f1_macro'] = float(f1_score(tgts, (preds >= thr).astype(int), average='macro', zero_division=0))
+        return m
+
+    # ── TRAIN LOOP ───────────────────────────────────────────
     def train(self):
-        ''' PyTorch training loop
-        '''
-        
-        self.args.logger.info('train() called: model={}, opt={}(lr={}), epochs={}, device={}'.format(
-                type(self.model).__name__, 
-                type(self.optimizer).__name__,
-                self.optimizer.param_groups[0]['lr'], 
-                self.args.epochs, 
-                self.device))
-        
-        # Add all wanted history information
-        history = {}
-        history['train_csv'] = self.args.train_path
-        history['train_loss'] = []
-        history['train_micro_auroc'] = []
-        history['train_micro_avg_prec'] = []  
-        history['train_macro_auroc'] = []
-        history['train_macro_avg_prec'] = [] 
-        
-        if self.args.val_path is not None:
-            history['val_csv'] = self.args.val_path
-            history['val_loss'] = []
-            history['val_micro_auroc'] = []
-            history['val_micro_avg_prec'] = []
-            history['val_macro_auroc'] = []
-            history['val_macro_avg_prec'] = []
-        
-        history['labels'] = self.args.labels
-        history['epochs'] = self.args.epochs
-        history['batch_size'] = self.args.batch_size
-        history['lr'] = self.args.lr
-        history['optimizer'] = self.optimizer
-        history['criterion'] = self.criterion
-        
-        start_time_sec = time.time()
-        
-        for epoch in range(1, self.args.epochs+1):
-            # --- TRAIN ON TRAINING SET ------------------------------------------
-            self.model.train()            
-            train_loss = 0.0
-            labels_all = torch.tensor((), device=self.device) # , device=torch.device('cuda:0')
-            logits_prob_all = torch.tensor((), device=self.device)
-            
-            batch_loss = 0.0
-            batch_count = 0
-            step = 0
-            
-            for batch_idx, (ecgs, ag, labels) in enumerate(self.train_dl):
-                ecgs = ecgs.to(self.device) # ECGs
-                ag = ag.to(self.device) # age and gender
-                labels = labels.to(self.device) # diagnoses in SNOMED CT codes  
-               
-                with torch.set_grad_enabled(True):                    
-        
-                    logits = self.model(ecgs, ag) 
-                    loss = self.criterion(logits, labels)
-                    logits_prob = self.sigmoid(logits)      
-                    loss_tmp = loss.item() * ecgs.size(0)
-                    labels_all = torch.cat((labels_all, labels), 0)
-                    logits_prob_all = torch.cat((logits_prob_all, logits_prob), 0)                    
-                    
-                    train_loss += loss_tmp
-                    
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
-                    
-                    # Printing training information
-                    if step % 100 == 0:
-                        batch_loss += loss_tmp
-                        batch_count += ecgs.size(0)
-                        batch_loss = batch_loss / batch_count
-                        self.args.logger.info('epoch {:^3} [{}/{}] train loss: {:>5.4f}'.format(
-                            epoch, 
-                            batch_idx * len(ecgs), 
-                            len(self.train_dl.dataset), 
-                            batch_loss
-                        ))
+        epochs, wu, base_lr = self.tc['epochs'], self.tc.get('warmup_epochs', 0), self.tc['lr']
+        patience = self.tc.get('patience', 10)
+        hist = {k: [] for k in ['train_loss','val_loss','train_auroc','val_auroc','val_auprc','val_f1','lr']}
 
-                        batch_loss = 0.0
-                        batch_count = 0
-                    step += 1
+        self.log(f'\n{"═"*74}\nTRAINING START\n{"═"*74}')
+        for ep in range(1, epochs + 1):
+            t0 = time.time()
+            if ep <= wu:
+                for pg in self.optimizer.param_groups: pg['lr'] = base_lr * ep / wu
 
-            
-            train_loss = train_loss / len(self.train_dl.dataset)            
-            train_macro_avg_prec, train_micro_avg_prec, train_macro_auroc, train_micro_auroc = cal_multilabel_metrics(labels_all, logits_prob_all, self.args.labels, self.args.threshold)
+            tl, tp, tt = self._run_epoch(self.train_loader, True)
+            vl, vp, vt = self._run_epoch(self.val_loader, False)
+            tm, vm = self._metrics(tp, tt), self._metrics(vp, vt)
+            lr = self.optimizer.param_groups[0]['lr']
 
-            self.args.logger.info('epoch {:^4}/{:^4} train loss: {:<6.2f}  train micro auroc: {:<6.2f}'.format( 
-                epoch, 
-                self.args.epochs, 
-                train_loss, 
-                train_micro_auroc))
+            if ep > wu and self.scheduler:
+                self.scheduler.step(vm['auroc_macro']) if isinstance(
+                    self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau) else self.scheduler.step()
 
-            # Add information for training history
-            history['train_loss'].append(train_loss)
-            history['train_micro_auroc'].append(train_micro_auroc)
-            history['train_micro_avg_prec'].append(train_micro_avg_prec)
-            history['train_macro_auroc'].append(train_macro_auroc)
-            history['train_macro_avg_prec'].append(train_macro_avg_prec)
-            
-            # --- EVALUATE ON VALIDATION SET ------------------------------------- 
-            if self.args.val_path is not None:
-                self.model.eval()
-                val_loss = 0.0  
-                labels_all = torch.tensor((), device=self.device)
-                logits_prob_all = torch.tensor((), device=self.device)  
-            
-                for ecgs, ag, labels in self.val_dl:
-                    ecgs = ecgs.to(self.device) # ECGs
-                    ag = ag.to(self.device) # age and gender
-                    labels = labels.to(self.device) # diagnoses in SNOMED CT codes 
-                    
-                    with torch.set_grad_enabled(False):  
-                        
-                        logits = self.model(ecgs, ag)
-                        loss = self.criterion(logits, labels)
-                        logits_prob = self.sigmoid(logits)
-                        val_loss += loss.item() * ecgs.size(0)                                 
-                        labels_all = torch.cat((labels_all, labels), 0)
-                        logits_prob_all = torch.cat((logits_prob_all, logits_prob), 0)
+            for k, v in zip(hist, [tl, vl, tm['auroc_macro'], vm['auroc_macro'], vm['auprc_macro'], vm['f1_macro'], lr]):
+                hist[k].append(v)
 
-                val_loss = val_loss / len(self.val_dl.dataset)
-                val_macro_avg_prec, val_micro_avg_prec, val_macro_auroc, val_micro_auroc = cal_multilabel_metrics(labels_all, logits_prob_all, self.args.labels, self.args.threshold)
-            
-                self.args.logger.info('                val loss:  {:<6.2f}   val micro auroc: {:<6.2f}   '.format(
-                    val_loss,
-                    val_micro_auroc))
-                
-                history['val_loss'].append(val_loss)
-                history['val_micro_auroc'].append(val_micro_auroc)
-                history['val_micro_avg_prec'].append(val_micro_avg_prec)         
-                history['val_macro_auroc'].append(val_macro_auroc)  
-                history['val_macro_avg_prec'].append(val_macro_avg_prec)
+            self.log(f'Ep {ep:>3}/{epochs} │ Loss {tl:.4f}/{vl:.4f} │ '
+                     f'AUROC {tm["auroc_macro"]:.4f}/{vm["auroc_macro"]:.4f} │ '
+                     f'AUPRC {vm["auprc_macro"]:.4f} │ F1 {vm["f1_macro"]:.4f} │ '
+                     f'LR {lr:.2e} │ {time.time()-t0:.0f}s')
 
-            # --------------------------------------------------------------------
+            cur = vm['auroc_macro']
+            if cur > self.best_metric:
+                self.best_metric, self.best_epoch, self.patience_ctr = cur, ep, 0
+                self.best_state = copy.deepcopy(self.model.state_dict())
+                self._save_ckpt(ep, vm)
+                self.log(f'  ✓ Best (ep {ep}, AUROC {cur:.4f})')
+            else:
+                self.patience_ctr += 1
+                if self.tc.get('early_stopping') and self.patience_ctr >= patience:
+                    self.log(f'  ✗ Early stop at ep {ep}'); break
 
-            # Create ROC Curves at the beginning, middle and end of training
-            if epoch == 1 or epoch == self.args.epochs/2 or epoch == self.args.epochs:
-                roc_curves(labels_all, logits_prob_all, self.args.labels, epoch, self.args.roc_save_dir)
+        self.log(f'\n{"═"*74}\nDONE — Best ep {self.best_epoch} (AUROC {self.best_metric:.4f})\n{"═"*74}')
+        if self.best_state: self.model.load_state_dict(self.best_state)
+        self._roc_curves(self.val_loader, 'val')
+        self._save_history(hist)
+        self.train_ds.close(); self.val_ds.close()
 
-            # Save a model at every 5th epoch (backup)
-            if epoch in list(range(self.args.epochs)[0::5]):
-                self.args.logger.info('Saved model at the epoch {}!'.format(epoch))
-                # Whether or not you use data parallelism, save the state dictionary this way
-                # to have the flexibility to load the model any way you want to any device you want
-                model_state_dict = self.model.module.state_dict() if self.device_count > 1 else self.model.state_dict()
-                    
-                # -- Save model
-                model_savepath = os.path.join(self.args.model_save_dir,
-                                              self.args.yaml_file_name + '_e' + str(epoch) + '.pth')
-                torch.save(model_state_dict, model_savepath)
+    # ── IO ───────────────────────────────────────────────────
+    def _save_ckpt(self, ep, metrics):
+        state = (self.model.module if isinstance(self.model, nn.DataParallel) else self.model).state_dict()
+        clean_cfg = json.loads(json.dumps({k: v for k, v in self.cfg.items() if k != 'logger'}, default=str))
+        torch.save(dict(epoch=ep, model_state_dict=state, optimizer_state_dict=self.optimizer.state_dict(),
+                        metrics=metrics, config=clean_cfg),
+                os.path.join(self.save_dir, 'best_model.pth'))
+        with open(os.path.join(self.save_dir, 'best_val_metrics.json'), 'w') as f:
+            json.dump({k: round(float(v), 6) if isinstance(v, (float, np.floating)) else v
+                       for k, v in metrics.items()}, f, indent=2)
 
-            # Save trained model (.pth), history (.pickle) and validation logits (.csv) after the last epoch
-            if epoch == self.args.epochs:
-                
-                self.args.logger.info('Saving the model, training history and validation logits...')
-                    
-                # Whether or not you use data parallelism, save the state dictionary this way
-                # to have the flexibility to load the model any way you want to any device you want
-                model_state_dict = self.model.module.state_dict() if self.device_count > 1 else self.model.state_dict()
-                    
-                # -- Save model
-                model_savepath = os.path.join(self.args.model_save_dir,
-                                              self.args.yaml_file_name  + '.pth')
-                torch.save(model_state_dict, model_savepath)
-                
-                # -- Save history
-                history_savepath = os.path.join(self.args.model_save_dir,
-                                                self.args.yaml_file_name + '_train_history.pickle')
-                with open(history_savepath, mode='wb') as file:
-                    pickle.dump(history, file, protocol=pickle.HIGHEST_PROTOCOL)
-                    
-                # -- Save the logits from validation if used, either save the logits from the training phase
-                if self.args.val_path is not None:
-                    self.args.logger.info('- Validation logits and labels saved')
-                    logits_csv_path = os.path.join(self.args.model_save_dir,
-                                               self.args.yaml_file_name + '_val_logits.csv') 
-                    labels_all_csv_path = os.path.join(self.args.model_save_dir,
-                                                self.args.yaml_file_name + '_val_labels.csv') 
-                    # Use filenames as indeces
-                    filenames = [os.path.basename(file) for file in self.validation_files]
+    def _roc_curves(self, loader, name):
+        self.model.eval(); _, preds, tgts = self._run_epoch(loader, False)
+        lc, nc = self.dc['label_columns'], preds.shape[1]
+        cols = 5; rows = (nc + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
+        for i, ax in enumerate(axes.flatten()):
+            if i >= nc: ax.set_visible(False); continue
+            p, n = tgts[:, i].sum(), len(tgts) - tgts[:, i].sum()
+            if p > 0 and n > 0:
+                fpr, tpr, _ = roc_curve(tgts[:, i], preds[:, i])
+                ax.plot(fpr, tpr, lw=2, label=f'AUC={roc_auc_score(tgts[:, i], preds[:, i]):.3f}')
+                ax.plot([0, 1], [0, 1], 'k--', alpha=.3); ax.legend(fontsize=8)
+            else: ax.text(.5, .5, 'N/A', ha='center', va='center')
+            ax.set_title(lc[i], fontsize=9)
+        fig.suptitle(f'ROC — {name} (best ep {self.best_epoch})'); plt.tight_layout()
+        plt.savefig(os.path.join(self.roc_dir, f'roc_{name}.png'), dpi=150, bbox_inches='tight'); plt.close()
 
-                else:
-                    self.args.logger.info('- Training logits and actual labels saved (no validation set available)')
-                    logits_csv_path = os.path.join(self.args.model_save_dir,
-                                               self.args.yaml_file_name + '_train_logits.csv') 
-                    labels_all_csv_path = os.path.join(self.args.model_save_dir,
-                                                self.args.yaml_file_name + '_train_labels.csv') 
-                    filenames = None
-                
-                # Save logits and corresponding labels
-                labels_numpy = labels_all.cpu().detach().numpy().astype(np.float32)
-                labels_df = pd.DataFrame(labels_numpy, columns=self.args.labels, index=filenames)
-                labels_df.to_csv(labels_all_csv_path, sep=',')
-
-                logits_numpy = logits_prob_all.cpu().detach().numpy().astype(np.float32)
-                logits_df = pd.DataFrame(logits_numpy, columns=self.args.labels, index=filenames)
-                logits_df.to_csv(logits_csv_path, sep=',')
-
-            del logits_prob_all
-            del labels_all
-            torch.cuda.empty_cache()
-         
-        # END OF TRAINING LOOP        
-        
-        end_time_sec       = time.time()
-        total_time_sec     = end_time_sec - start_time_sec
-        time_per_epoch_sec = total_time_sec / self.args.epochs
-        self.args.logger.info('Time total:     %5.2f sec' % (total_time_sec))
-        self.args.logger.info('Time per epoch: %5.2f sec' % (time_per_epoch_sec))
+    def _save_history(self, hist):
+        with open(os.path.join(self.save_dir, 'history.json'), 'w') as f: json.dump(hist, f, indent=2)
+        eps = range(1, len(hist['train_loss']) + 1)
+        fig, ((a1, a2), (a3, a4)) = plt.subplots(2, 2, figsize=(14, 10))
+        for ax, ks, t in [(a1, ['train_loss','val_loss'], 'Loss'),
+                          (a2, ['train_auroc','val_auroc'], 'AUROC'),
+                          (a3, ['val_auprc','val_f1'], 'AUPRC & F1')]:
+            for k in ks: ax.plot(eps, hist[k], label=k)
+            ax.set_title(t); ax.legend(); ax.grid(True, alpha=.3)
+        a4.plot(eps, hist['lr'], 'r'); a4.set_title('LR'); a4.set_yscale('log'); a4.grid(True, alpha=.3)
+        plt.tight_layout(); plt.savefig(os.path.join(self.save_dir, 'training_curves.png'), dpi=150); plt.close()

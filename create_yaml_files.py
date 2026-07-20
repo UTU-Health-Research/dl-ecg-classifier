@@ -1,4 +1,5 @@
 """
+Usage: python create_yaml_files.py
 Generates a single experiment configuration YAML that serves as
 the source of truth for training, evaluation, and inference.
 
@@ -10,7 +11,7 @@ Input
     data/preprocessed_uppsala_data/splits/vitals_medians.json
 
 Output
-    configs/experiment_001.yaml
+    configs/experiment_xxx.yaml
 """
 
 import os, json, sys
@@ -29,7 +30,7 @@ METADATA_CSV    = os.path.join(DATA_DIR, 'metadata.csv')
 MEDIANS_JSON    = os.path.join(SPLITS_DIR, 'vitals_medians.json')
 
 CONFIG_DIR      = os.path.join(os.getcwd(), 'configs')
-EXPERIMENT_NAME = 'experiment_001'
+EXPERIMENT_NAME = 'experiment_003'
 
 
 # ══════════════════════════════════════════════════════════════
@@ -142,7 +143,7 @@ def build_config(info):
 
         # Loss
         'loss':           'BCEWithLogitsLoss',
-        'class_weights':  'auto',           # set to list of 19 floats or null
+        'class_weights':  'auto',   
 
         # Early stopping
         'early_stopping': True,

@@ -68,6 +68,7 @@ class Training:
         if cw == 'auto':
             pos = self.train_ds.labels.sum(0).clip(min=1)
             w = (len(self.train_ds.labels) - pos) / pos
+            w = np.sqrt(w)
             return torch.tensor(w, dtype=torch.float32).to(self.device)
         if isinstance(cw, list):
             return torch.tensor(cw, dtype=torch.float32).to(self.device)

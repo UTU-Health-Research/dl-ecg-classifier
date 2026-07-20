@@ -1,3 +1,7 @@
+'''
+usage: python train_model.py experiment_xxx.yaml
+'''
+
 import os, sys, torch, random, logging
 import numpy as np
 from ruamel.yaml import YAML

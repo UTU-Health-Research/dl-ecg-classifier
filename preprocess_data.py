@@ -47,7 +47,7 @@ SEGMENT_SAMPLES    = TARGET_FS * SEGMENT_DURATION_S   # 2500
 MIN_SEGMENT_FRAC   = 0.5
 
 # ── Segment cap ──
-MAX_SEGMENTS_PER_EPISODE = 10   # randomly sample this many; set None for all
+MAX_SEGMENTS_PER_EPISODE = 50   # randomly sample this many; set None for all
 RANDOM_SEED              = 42
 
 # ── Batched HDF5 ──

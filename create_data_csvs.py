@@ -1,4 +1,5 @@
 """
+Usage: python create_data_csvs.py
 Stratified multi-label train / val / test split (70 / 15 / 15)
 at the CareEpisodeID level using iterative stratification.
 

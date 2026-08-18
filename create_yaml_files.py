@@ -24,13 +24,13 @@ from datetime import datetime
 #  PATHS  (edit these if your layout differs)
 # ══════════════════════════════════════════════════════════════
 
-DATA_DIR        = os.path.join(os.getcwd(), 'data', 'preprocessed_uppsala_data')
+DATA_DIR        = os.path.join(os.getcwd(), 'data', 'preprocessed_uppsala_data_200K')
 SPLITS_DIR      = os.path.join(DATA_DIR, 'split_csvs')
 METADATA_CSV    = os.path.join(DATA_DIR, 'metadata.csv')
 MEDIANS_JSON    = os.path.join(SPLITS_DIR, 'vitals_medians.json')
 
 CONFIG_DIR      = os.path.join(os.getcwd(), 'configs')
-EXPERIMENT_NAME = 'experiment_004'
+EXPERIMENT_NAME = 'experiment_008'
 
 
 # ══════════════════════════════════════════════════════════════
@@ -132,7 +132,7 @@ def build_config(info):
     config['training'] = {
         'batch_size':     64,
         'num_workers':    4,
-        'epochs':         30,
+        'epochs':         50,
         'lr':             0.001,
         'weight_decay':   0.00001,
 
@@ -142,12 +142,20 @@ def build_config(info):
         'min_lr':         0.000001,
 
         # Loss
-        'loss':           'BCEWithLogitsLoss',
-        'class_weights':  'auto',   
+        # 'loss':           'BCEWithLogitsLoss',
+        # 'class_weights':  'auto',  
+
+        # following four lines are only for asymmetric loss
+        'loss': 'AsymmetricLoss',
+        'asl_gamma_neg': 4, 
+        'asl_gamma_pos': 1,
+        'asl_clip': 0.05,
+
+        'class_weights': None,   
 
         # Early stopping
         'early_stopping': True,
-        'patience':       7,
+        'patience':       10,
         'monitor':        'val_auroc_macro',
         'monitor_mode':   'max',
 

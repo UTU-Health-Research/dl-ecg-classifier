@@ -20,3 +20,5 @@ configs/*
 
 # Ignore the experiments directory
 experiments/*
+
+*.h5

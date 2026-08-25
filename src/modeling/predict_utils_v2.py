@@ -2,6 +2,7 @@ import os, json
 import numpy as np, torch, torch.nn as nn
 import pandas as pd
 from torch.utils.data import DataLoader
+from collections import defaultdict
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, roc_curve
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -75,6 +76,7 @@ class Predicting:
             self.thresholds = np.full(len(lc), default)
             self.log(f'\nUsing default threshold: {default}')
 
+    # ── Segment-level inference (same as V1) ──────────────────
     def _run_inference(self):
         self.model.eval()
         total, n, preds, tgts = 0., 0, [], []
@@ -88,43 +90,93 @@ class Predicting:
             tgts.append(lbl.cpu().numpy())
         return total / max(n, 1), np.concatenate(preds), np.concatenate(tgts)
 
-    def _metrics(self, preds, tgts):
+    # ── Session-level aggregation ─────────────────────────────
+    def _aggregate_by_session(self, seg_preds, seg_tgts):
+        """
+        Returns:
+            ses_ids    : list[SessionID] in first-occurrence order
+            soft_preds : (N_ses, C)  mean probability across segments
+            hard_preds : (N_ses, C)  majority binary vote across segments
+            ses_tgts   : (N_ses, C)  ground truth (identical across segments)
+        """
+        sids   = self.test_meta['SessionID'].values
+        groups = defaultdict(list)
+        for i, s in enumerate(sids): groups[s].append(i)
+
+        ses_ids, soft_preds, hard_preds, ses_tgts = [], [], [], []
+        for sid, idxs in groups.items():
+            seg_p = seg_preds[idxs]                              # (n_segs, C)
+            soft  = seg_p.mean(axis=0)                           # mean probability
+            hard  = ((seg_p >= self.thresholds).astype(int)      # binary per segment
+                     .mean(axis=0) >= 0.5).astype(int)           # majority vote
+
+            ses_ids.append(sid)
+            soft_preds.append(soft)
+            hard_preds.append(hard)
+            ses_tgts.append(seg_tgts[idxs[0]])
+
+        return ses_ids, np.array(soft_preds), np.array(hard_preds), np.array(ses_tgts)
+
+    # ── Metrics (AUROC/AUPRC on soft probs; F1 on hard vote) ──
+    def _metrics(self, soft_preds, hard_preds, tgts):
         lc, thr = self.dc['label_columns'], self.thresholds
         m, aurocs, auprcs, per_class = {}, [], [], []
         for i, c in enumerate(lc):
             p, n = tgts[:, i].sum(), len(tgts) - tgts[:, i].sum()
             row = {'label': c, 'n_pos': int(p), 'n_neg': int(n), 'threshold': float(thr[i])}
             if p > 0 and n > 0:
-                a = roc_auc_score(tgts[:, i], preds[:, i]); aurocs.append(a); m[f'auroc_{c}'] = a; row['auroc'] = a
+                a = roc_auc_score(tgts[:, i], soft_preds[:, i]); aurocs.append(a); m[f'auroc_{c}'] = a; row['auroc'] = a
             if p > 0:
-                a = average_precision_score(tgts[:, i], preds[:, i]); auprcs.append(a); m[f'auprc_{c}'] = a; row['auprc'] = a
-            row['f1'] = float(f1_score(tgts[:, i], (preds[:, i] >= thr[i]).astype(int), zero_division=0))
+                a = average_precision_score(tgts[:, i], soft_preds[:, i]); auprcs.append(a); m[f'auprc_{c}'] = a; row['auprc'] = a
+            row['f1'] = float(f1_score(tgts[:, i], hard_preds[:, i], zero_division=0))
             per_class.append(row)
-        binary = (preds >= thr).astype(int)
         m['auroc_macro'] = float(np.mean(aurocs)) if aurocs else 0.
         m['auprc_macro'] = float(np.mean(auprcs)) if auprcs else 0.
-        m['f1_macro']    = float(f1_score(tgts, binary, average='macro',  zero_division=0))
-        m['auroc_micro'] = float(roc_auc_score(tgts, preds, average='micro'))
-        m['auprc_micro'] = float(average_precision_score(tgts, preds, average='micro'))
-        m['f1_micro']    = float(f1_score(tgts, binary, average='micro',  zero_division=0))
+        m['f1_macro']    = float(f1_score(tgts, hard_preds, average='macro',  zero_division=0))
+        m['auroc_micro'] = float(roc_auc_score(tgts, soft_preds, average='micro'))
+        m['auprc_micro'] = float(average_precision_score(tgts, soft_preds, average='micro'))
+        m['f1_micro']    = float(f1_score(tgts, hard_preds, average='micro',  zero_division=0))
         return m, per_class
 
-    def _save_predictions_csv(self, preds, tgts):
-        lc = self.dc['label_columns']
+    # ── CSV: one row per segment ──────────────────────────────
+    def _save_segment_csv(self, seg_preds, seg_tgts, ses_ids, hard_preds):
+        lc   = self.dc['label_columns']
+        sids = self.test_meta['SessionID'].values
+        ses_idx = {sid: i for i, sid in enumerate(ses_ids)}
+        seg_ses = np.array([ses_idx[s] for s in sids])   # segment → session index
+
         df = self.test_meta.copy()
         for i, c in enumerate(lc):
-            df[f'{c}_prob'] = preds[:, i].astype(np.float32)
-            df[f'{c}_pred'] = (preds[:, i] >= self.thresholds[i]).astype(np.int8)
-            df[f'{c}_true'] = tgts[:, i].astype(np.int8)
+            df[f'{c}_seg_prob']  = seg_preds[:, i].astype(np.float32)
+            df[f'{c}_seg_pred']  = (seg_preds[:, i] >= self.thresholds[i]).astype(np.int8)
+            df[f'{c}_vote_pred'] = hard_preds[seg_ses, i].astype(np.int8)  # session majority vote
+            df[f'{c}_true']      = seg_tgts[:, i].astype(np.int8)
         df.to_csv(os.path.join(self.save_dir, 'test_segment_predictions.csv'), index=False)
         self.log('Saved → test_segment_predictions.csv')
 
-    def predict(self):
-        self.log(f'\n{"═"*74}\nTEST EVALUATION — Segment-Level\n{"═"*74}')
-        loss, preds, tgts = self._run_inference()
-        metrics, per_class = self._metrics(preds, tgts)
+    # ── CSV: one row per session ──────────────────────────────
+    def _save_session_csv(self, ses_ids, soft_preds, hard_preds, ses_tgts):
+        lc = self.dc['label_columns']
+        rows = []
+        for i, sid in enumerate(ses_ids):
+            row = {'SessionID': sid}
+            for j, c in enumerate(lc):
+                row[f'{c}_soft_prob'] = float(soft_preds[i, j])
+                row[f'{c}_soft_pred'] = int(soft_preds[i, j] >= self.thresholds[j])
+                row[f'{c}_hard_pred'] = int(hard_preds[i, j])
+                row[f'{c}_true']      = int(ses_tgts[i, j])
+            rows.append(row)
+        pd.DataFrame(rows).to_csv(
+            os.path.join(self.save_dir, 'test_session_predictions.csv'), index=False)
+        self.log('Saved → test_session_predictions.csv')
 
-        self.log(f'\nTest Loss : {loss:.4f}')
+    def predict(self):
+        self.log(f'\n{"═"*74}\nTEST EVALUATION — Session-Level Majority Voting\n{"═"*74}')
+        loss, seg_preds, seg_tgts = self._run_inference()
+        ses_ids, soft_preds, hard_preds, ses_tgts = self._aggregate_by_session(seg_preds, seg_tgts)
+        metrics, per_class = self._metrics(soft_preds, hard_preds, ses_tgts)
+
+        self.log(f'\nTest Loss : {loss:.4f}  |  Sessions: {len(ses_ids):,}  |  Segments: {len(seg_preds):,}')
         self.log(f'\n{"Metric":<16} {"Macro":>10} {"Micro":>10}\n{"─"*38}')
         for name, mk, mik in [("AUROC","auroc_macro","auroc_micro"),
                                ("AUPRC","auprc_macro","auprc_micro"),
@@ -141,8 +193,9 @@ class Predicting:
             json.dump({k: round(float(v), 6) if isinstance(v, (float, np.floating)) else v
                        for k, v in {'test_loss': loss, **metrics, 'per_class': per_class}.items()}, f, indent=2)
 
-        self._save_predictions_csv(preds, tgts)
-        self._roc_curves(preds, tgts)
+        self._save_segment_csv(seg_preds, seg_tgts, ses_ids, hard_preds)
+        self._save_session_csv(ses_ids, soft_preds, hard_preds, ses_tgts)
+        self._roc_curves(soft_preds, ses_tgts)
         self.test_ds.close()
         self.log(f'\nResults saved to {self.save_dir}')
 
@@ -159,7 +212,7 @@ class Predicting:
                 ax.plot([0,1],[0,1],'k--',alpha=.3); ax.legend(fontsize=8)
             else: ax.text(.5,.5,'N/A',ha='center',va='center')
             ax.set_title(lc[i], fontsize=9)
-        fig.suptitle('ROC — Test Set (Segment-Level)'); plt.tight_layout()
+        fig.suptitle('ROC — Test Set (Session-Level)'); plt.tight_layout()
         plt.savefig(os.path.join(self.roc_dir, 'roc_test.png'), dpi=150, bbox_inches='tight')
         plt.close()
         self.log(f'ROC curves saved to {self.roc_dir}')

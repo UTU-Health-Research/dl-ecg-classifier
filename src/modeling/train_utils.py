@@ -71,7 +71,7 @@ class Training:
         if self.logger: self.logger.info(msg)
 
     # ── SETUP ────────────────────────────────────────────────
-    def setup(self):
+    def setup(self, resume_path=None):
         self.log(f'Device: {self.device}')
         ds_kw = dict(data_dir=self.dc['data_dir'],
                      label_columns=self.dc['label_columns'],
@@ -85,7 +85,7 @@ class Training:
 
         nw, bs = self.tc['num_workers'], self.tc['batch_size']
         ldr_kw = dict(batch_size=bs, num_workers=nw, pin_memory=True,
-                      persistent_workers=nw > 0, worker_init_fn=_worker_init)
+                      persistent_workers=False, worker_init_fn=_worker_init, prefetch_factor=1)
         self.train_loader = DataLoader(
             self.train_ds, shuffle=True, drop_last=True, **ldr_kw)
         self.val_loader = DataLoader(
@@ -117,6 +117,9 @@ class Training:
         self.patience_ctr, self.best_state = 0, None
         self.save_dir = os.path.join(
             os.getcwd(), 'experiments', self.cfg['experiment']['name'])
+        self.start_epoch = 1
+        if resume_path:
+            self._resume(resume_path)
         self.roc_dir = os.path.join(self.save_dir, 'ROC_curves')
         os.makedirs(self.roc_dir, exist_ok=True)
 
@@ -124,6 +127,16 @@ class Training:
         y = Y()
         with open(os.path.join(self.save_dir, 'config.yaml'), 'w') as f:
             y.dump({k: v for k, v in self.cfg.items() if k != 'logger'}, f)
+
+
+    def _resume(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt['model_state_dict'])
+        self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        self.start_epoch = ckpt['epoch'] + 1
+        self.best_metric = ckpt['metrics']['auroc_macro']
+        self.best_epoch  = ckpt['epoch']
+        self.log(f'Resumed from {path} (epoch {ckpt["epoch"]}, AUROC {self.best_metric:.4f})')
 
     # ── LOSS BUILDER ─────────────────────────────────────────
     def _build_loss(self):
@@ -263,7 +276,7 @@ class Training:
             'val_auprc', 'val_f1', 'lr']}
 
         self.log(f'\n{"═" * 74}\nTRAINING START\n{"═" * 74}')
-        for ep in range(1, epochs + 1):
+        for ep in range(self.start_epoch, epochs + 1):
             t0 = time.time()
             if ep <= wu:
                 for pg in self.optimizer.param_groups:

@@ -30,7 +30,7 @@ METADATA_CSV    = os.path.join(DATA_DIR, 'metadata.csv')
 MEDIANS_JSON    = os.path.join(SPLITS_DIR, 'vitals_medians.json')
 
 CONFIG_DIR      = os.path.join(os.getcwd(), 'configs')
-EXPERIMENT_NAME = 'experiment_009'
+EXPERIMENT_NAME = 'experiment_010'
 
 
 # ══════════════════════════════════════════════════════════════
@@ -108,6 +108,8 @@ def build_config(info):
     }
 
     # ── Vitals ───────────────────────────────────────────────
+    # Then in the dataloader, whenever a vital is NaN for any 
+    # segment (in train, val, or test), it gets replaced with that training-set median.
     config['vitals'] = {
         'columns':       ['Vital_Resp_First', 'Vital_HR_First', 'Vital_Temp_First'],
         'dim':           3,
@@ -161,6 +163,10 @@ def build_config(info):
         # Checkpointing
         'save_dir':       'checkpoints',
         'save_best_only': True,
+
+        # Following two lines for majority voting approach
+        'max_segs_per_session': 32,  # cap segments per session in training (memory safety)
+        'accum_sessions': 8,          # gradient accumulation across N sessions (stability)
     }
 
     # ── Evaluation ───────────────────────────────────────────

@@ -13,6 +13,8 @@ from src.modeling.models.mobilenetv2_vitals_11lead import MobileNetV2_1D_Vitals
 
 
 # ── LOSS ─────────────────────────────────────────────────────
+# Asymmetric Loss for multi-label classification.
+#     Reference: https://arxiv.org/abs/2009.14119
 class AsymmetricLoss(nn.Module):
     def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8):
         super().__init__()
@@ -196,10 +198,17 @@ class Training:
             lbl = lbl.to(self.device)  # (n_segs, C) — identical rows per session
 
             with torch.set_grad_enabled(train):
-                logits     = self.model(ecg, vit)          # (n_segs, C)
-                avg_logits = logits.mean(0, keepdim=True)  # (1, C)  ← soft vote
-                ses_lbl    = lbl[0:1]                      # (1, C)
-                loss       = self.criterion(avg_logits, ses_lbl)
+                logits  = self.model(ecg, vit)             # (n_segs, C)
+                if train:
+                    if logits.shape[0] > 4:
+                        k = max(1, int(0.1 * logits.shape[0]))
+                        agg_logits = logits.sort(0).values[k:-k].mean(0, keepdim=True)
+                    else:
+                        agg_logits = logits.mean(0, keepdim=True)
+                else:
+                    agg_logits = logits.median(0).values.unsqueeze(0)
+                ses_lbl = lbl[0:1]                         # (1, C)
+                loss    = self.criterion(agg_logits, ses_lbl)
                 if train: (loss / accum).backward()
 
             if train and ((step + 1) % accum == 0):
@@ -209,7 +218,7 @@ class Training:
 
             total += loss.item(); n += 1
             with torch.no_grad():
-                preds.append(torch.sigmoid(avg_logits).cpu().numpy())
+                preds.append(torch.sigmoid(agg_logits).cpu().numpy())
             tgts.append(ses_lbl.cpu().numpy())
 
         # flush remaining accumulated gradients

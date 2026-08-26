@@ -30,7 +30,7 @@ METADATA_CSV    = os.path.join(DATA_DIR, 'metadata.csv')
 MEDIANS_JSON    = os.path.join(SPLITS_DIR, 'vitals_medians.json')
 
 CONFIG_DIR      = os.path.join(os.getcwd(), 'configs')
-EXPERIMENT_NAME = 'experiment_010'
+EXPERIMENT_NAME = 'experiment_011'
 
 
 # ══════════════════════════════════════════════════════════════
@@ -134,25 +134,25 @@ def build_config(info):
     config['training'] = {
         'batch_size':     64,
         'num_workers':    4,
-        'epochs':         50,
+        'epochs':         150,
         'lr':             0.001,
         'weight_decay':   0.00001,
 
         # Scheduler
         'scheduler':      'cosine',
         'warmup_epochs':  3,
-        'min_lr':         0.000001,
+        'min_lr':         0.0001,
 
         # Loss
-        'loss':           'BCEWithLogitsLoss',
-        'class_weights':  'auto',  
+        # 'loss':           'BCEWithLogitsLoss',
+        # 'class_weights':  'auto',  
 
-        # # following four lines are only for asymmetric loss
-        # 'loss': 'AsymmetricLoss',
-        # 'asl_gamma_neg': 4, 
-        # 'asl_gamma_pos': 1,
-        # 'asl_clip': 0.05,
-        # 'class_weights': None,   
+        # following four lines are only for asymmetric loss
+        'loss': 'AsymmetricLoss',
+        'asl_gamma_neg': 4, 
+        'asl_gamma_pos': 1,
+        'asl_clip': 0.05,
+        'class_weights': None,   
 
         # Early stopping
         'early_stopping': True,

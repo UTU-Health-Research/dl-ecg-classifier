@@ -11,6 +11,7 @@ import h5py
 import pyarrow.parquet as pq
 from tqdm import tqdm
 from collections import defaultdict, Counter
+from scipy import signal as sp_signal
 from src.dataloader.transforms import BandPassFilter, Spline_interpolation
 
 # ══════════════════════════════════════════════════════════════
@@ -108,6 +109,28 @@ def make_segments(ml, seg_len, min_frac):
         segs.append(pad)
     return segs
 
+def filter_hr_peaks(peaks, fs, hr_min=40, hr_max=200, kernel_size=7, sdsd_max=0.35):
+    rri = np.diff(peaks) / fs
+    hr  = 60 / rri
+    hr_med = sp_signal.medfilt(hr, kernel_size)
+    sdsd   = np.std(np.diff(rri))
+    if sdsd_max is not None and sdsd > sdsd_max:
+        return np.array([]), np.nan
+    valid_rri    = rri[(hr_med >= hr_min) & (hr_med <= hr_max)]
+    if not len(valid_rri): return np.array([]), np.nan
+    valid_hr_mean = 60 / np.mean(valid_rri)
+    cum = peaks[0]
+    vp  = [cum]
+    for r in valid_rri:
+        cum += r * fs; vp.append(int(cum))
+    return np.array(vp), valid_hr_mean
+
+def is_valid_segment(seg, fs=TARGET_FS, hr_min=40, hr_max=200, sdsd_max=0.35):
+    """Quality gate: R-peak check on Lead II (index 1)."""
+    peaks, _ = sp_signal.find_peaks(seg[1], distance=int(60/hr_max*fs))
+    if len(peaks) < 3: return False
+    vp, vhr = filter_hr_peaks(peaks, fs, hr_min, hr_max, sdsd_max=sdsd_max)
+    return len(vp) > 0 and not np.isnan(vhr)
 
 # ══════════════════════════════════════════════════════════════
 #  PROCESS ONE SESSION

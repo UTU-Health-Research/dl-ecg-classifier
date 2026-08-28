@@ -30,7 +30,7 @@ METADATA_CSV    = os.path.join(DATA_DIR, 'metadata.csv')
 MEDIANS_JSON    = os.path.join(SPLITS_DIR, 'vitals_medians.json')
 
 CONFIG_DIR      = os.path.join(os.getcwd(), 'configs')
-EXPERIMENT_NAME = 'experiment_011'
+EXPERIMENT_NAME = 'experiment_012'
 
 
 # ══════════════════════════════════════════════════════════════
@@ -141,7 +141,7 @@ def build_config(info):
         # Scheduler
         'scheduler':      'cosine',
         'warmup_epochs':  3,
-        'min_lr':         0.0001,
+        'min_lr':         0.000001,
 
         # Loss
         # 'loss':           'BCEWithLogitsLoss',

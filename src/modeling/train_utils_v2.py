@@ -197,18 +197,27 @@ class Training:
             vit = vit.to(self.device)  # (n_segs, 3)
             lbl = lbl.to(self.device)  # (n_segs, C) — identical rows per session
 
+            # Uncomment the following block for trimmed mean aggregation (drop top/bottom 10% logits per session)
+            # with torch.set_grad_enabled(train):
+            #     logits  = self.model(ecg, vit)             # (n_segs, C)
+            #     if train:
+            #         if logits.shape[0] > 4:
+            #             k = max(1, int(0.1 * logits.shape[0]))
+            #             agg_logits = logits.sort(0).values[k:-k].mean(0, keepdim=True)
+            #         else:
+            #             agg_logits = logits.mean(0, keepdim=True)
+            #     else:
+            #         agg_logits = logits.median(0).values.unsqueeze(0)
+            #     ses_lbl = lbl[0:1]                         # (1, C)
+            #     loss    = self.criterion(agg_logits, ses_lbl)
+            #     if train: (loss / accum).backward()
+
+            # uncomment the following block for simple mean aggregation (no trimming)
             with torch.set_grad_enabled(train):
-                logits  = self.model(ecg, vit)             # (n_segs, C)
-                if train:
-                    if logits.shape[0] > 4:
-                        k = max(1, int(0.1 * logits.shape[0]))
-                        agg_logits = logits.sort(0).values[k:-k].mean(0, keepdim=True)
-                    else:
-                        agg_logits = logits.mean(0, keepdim=True)
-                else:
-                    agg_logits = logits.median(0).values.unsqueeze(0)
-                ses_lbl = lbl[0:1]                         # (1, C)
-                loss    = self.criterion(agg_logits, ses_lbl)
+                logits     = self.model(ecg, vit)          # (n_segs, C)
+                avg_logits = logits.mean(0, keepdim=True)  # (1, C)  ← soft vote
+                ses_lbl    = lbl[0:1]                      # (1, C)
+                loss       = self.criterion(avg_logits, ses_lbl)
                 if train: (loss / accum).backward()
 
             if train and ((step + 1) % accum == 0):
@@ -217,8 +226,14 @@ class Training:
                 self.optimizer.zero_grad()
 
             total += loss.item(); n += 1
+            # uncomment the following line for trimmed mean aggregation
+            # with torch.no_grad():
+            #     preds.append(torch.sigmoid(agg_logits).cpu().numpy())
+            
+            # uncomment the following line for simple mean aggregation
             with torch.no_grad():
-                preds.append(torch.sigmoid(agg_logits).cpu().numpy())
+                preds.append(torch.sigmoid(avg_logits).cpu().numpy())
+
             tgts.append(ses_lbl.cpu().numpy())
 
         # flush remaining accumulated gradients

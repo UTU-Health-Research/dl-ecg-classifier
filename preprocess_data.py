@@ -125,12 +125,17 @@ def filter_hr_peaks(peaks, fs, hr_min=40, hr_max=200, kernel_size=7, sdsd_max=0.
         cum += r * fs; vp.append(int(cum))
     return np.array(vp), valid_hr_mean
 
-def is_valid_segment(seg, fs=TARGET_FS, hr_min=40, hr_max=200, sdsd_max=0.35):
-    """Quality gate: R-peak check on Lead II (index 1)."""
-    peaks, _ = sp_signal.find_peaks(seg[1], distance=int(60/hr_max*fs))
-    if len(peaks) < 3: return False
-    vp, vhr = filter_hr_peaks(peaks, fs, hr_min, hr_max, sdsd_max=sdsd_max)
-    return len(vp) > 0 and not np.isnan(vhr)
+def check_segment_quality(seg, fs=TARGET_FS, hr_min=40, hr_max=200,
+                           sdsd_max=0.35, min_peaks=8, kernel_size=7):
+    """R-peak/HR-based quality check on Lead II (index 1). Returns dict of metrics."""
+    peaks, _ = sp_signal.find_peaks(seg[1], distance=int(60 / hr_max * fs))
+    if len(peaks) < min_peaks:          # need >= kernel_size hr values, i.e. peaks-1 >= kernel_size
+        return {'is_valid': False, 'n_peaks': len(peaks), 'hr_mean': np.nan}
+
+    vp, vhr = filter_hr_peaks(peaks, fs, hr_min, hr_max,
+                               kernel_size=kernel_size, sdsd_max=sdsd_max)
+    is_valid = len(vp) > 0 and not np.isnan(vhr)
+    return {'is_valid': is_valid, 'n_peaks': len(vp), 'hr_mean': vhr}
 
 # ══════════════════════════════════════════════════════════════
 #  PROCESS ONE SESSION
@@ -162,18 +167,26 @@ def process_session(ses_id, ses_df, ses_meta, seg_counter, meta_rows, writer):
     del ml
     if not all_segs: return seg_counter, 'no_segments'
 
+    prev_counter = seg_counter
     n_total = len(all_segs)
     for i, arr in enumerate(all_segs):
+        q = check_segment_quality(arr)
+        if not q['is_valid']:
+            continue  # reject noisy segment — all 11 leads dropped together
+
         seg_id = f'seg_{seg_counter:08d}'
         batch  = writer.write(seg_id, arr)
         meta_rows.append({
             'ECG_ID': seg_id, 'SessionID': ses_id,
             'batch_file': batch, 'fs': TARGET_FS,
             'segment_index': i, 'n_segments_total': n_total,
+            'hr_mean': q['hr_mean'], 'n_valid_peaks': q['n_peaks'],
             **ses_meta,
         })
         seg_counter += 1
 
+    if seg_counter == prev_counter:
+        return seg_counter, 'no_valid_segments'
     return seg_counter, 'ok'
 
 

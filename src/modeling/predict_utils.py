@@ -7,7 +7,9 @@ import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from src.dataloader.ecg_dataset import ECGVitalsDataset
-from src.modeling.models.mobilenetv2_vitals_11lead import MobileNetV2_1D_Vitals
+# from src.modeling.models.mobilenetv2_vitals_11lead import MobileNetV2_1D_Vitals
+from src.modeling.models.seresnet18_vitals_11lead import SEResNet18_1D_Vitals
+
 
 
 def _worker_init(worker_id):
@@ -46,12 +48,18 @@ class Predicting:
             worker_init_fn=_worker_init)
 
         mc = self.mc
-        self.model = MobileNetV2_1D_Vitals(
-            input_channels=mc['input_channels'], alpha=mc['alpha'],
-            num_classes=mc['num_classes'], vitals_dim=mc['vitals_dim'],
-            vitals_hidden_dim=mc['vitals_hidden_dim'],
-            stride_size=list(mc['stride_size']),
-            kernel_size=mc['kernel_size'], dropout_rate=mc['dropout_rate'])
+        # self.model = MobileNetV2_1D_Vitals(
+        #     input_channels=mc['input_channels'], alpha=mc['alpha'],
+        #     num_classes=mc['num_classes'], vitals_dim=mc['vitals_dim'],
+        #     vitals_hidden_dim=mc['vitals_hidden_dim'],
+        #     stride_size=list(mc['stride_size']),
+        #     kernel_size=mc['kernel_size'], dropout_rate=mc['dropout_rate'])
+        self.model = SEResNet18_1D_Vitals(
+                input_channels=mc['input_channels'],
+                num_classes=mc['num_classes'],
+                vitals_dim=mc['vitals_dim'],
+                vitals_hidden_dim=mc['vitals_hidden_dim'],
+                dropout_rate=mc['dropout_rate'])
 
         ckpt_path = self.cfg['checkpoint_path']
         self.log(f'Loading checkpoint: {ckpt_path}')

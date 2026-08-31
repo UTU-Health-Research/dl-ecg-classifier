@@ -30,7 +30,7 @@ METADATA_CSV    = os.path.join(DATA_DIR, 'metadata.csv')
 MEDIANS_JSON    = os.path.join(SPLITS_DIR, 'vitals_medians.json')
 
 CONFIG_DIR      = os.path.join(os.getcwd(), 'configs')
-EXPERIMENT_NAME = 'experiment_012'
+EXPERIMENT_NAME = 'experiment_013'
 
 
 # ══════════════════════════════════════════════════════════════
@@ -119,13 +119,14 @@ def build_config(info):
 
     # ── Model ────────────────────────────────────────────────
     config['model'] = {
-        'architecture':     'MobileNetV2_1D_Vitals',
+        # 'architecture':     'MobileNetV2_1D_Vitals',
+        'architecture':     'SEResNet18_1D_Vitals',
         'input_channels':   11,
         'num_classes':      info['num_classes'],
         'alpha':            1.0,
         'stride_size':      [2, 2, 2, 2, 2],
         'kernel_size':      9,
-        'dropout_rate':     0.3,
+        'dropout_rate':     0.2,
         'vitals_dim':       3,
         'vitals_hidden_dim': 16,
     }

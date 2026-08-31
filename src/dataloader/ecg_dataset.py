@@ -4,7 +4,7 @@ from torch.utils.data import Dataset
 class ECGVitalsDataset(Dataset):
     def __init__(self, csv_path, data_dir, label_columns, vitals_columns, vitals_medians, transform=None):
         self.data_dir, self.transform, self._h5 = data_dir, transform, {}
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, low_memory=False)
         for c in vitals_columns: df[c] = df[c].fillna(vitals_medians.get(c, 0.0))
         df[label_columns] = df[label_columns].fillna(0)
         self.ecg_ids     = df['ECG_ID'].values

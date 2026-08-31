@@ -6,8 +6,8 @@ python train_model.py experiment_xxx.yaml experiments/experiment_xxx/best_model.
 import os, sys, torch, random, logging
 import numpy as np
 from ruamel.yaml import YAML
-# from src.modeling.train_utils import Training
-from src.modeling.train_utils_v2 import Training
+from src.modeling.train_utils import Training
+# from src.modeling.train_utils_v2 import Training
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
 
